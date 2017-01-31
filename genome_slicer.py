@@ -1,7 +1,11 @@
-from Bio import SeqIO
+from Bio import SeqIO, SeqRecord, Seq
 from Bio.SeqFeature import SeqFeature, FeatureLocation
 import csv
 from collections import defaultdict
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from Bio.Graphics import GenomeDiagram
+from full_genome_promoters import find_35_10_promoters
 
 def feature_to_gene_list(iterable):
     gene_list = []
@@ -76,31 +80,30 @@ def get_ss_IGRs(ref, gene_list, min_igr_length, igr_feature_type, strand, leadin
             comparison_gene_list_position += 1
     return ss_IGR_set
 
-def define_gene_space(gene_list):
-    gene_space = set()
-    # Sort list of genes by start position
-    gene_list.sort(key=lambda tup: tup[1])
-    base_gene_list_position = 0
-    comparison_gene_list_position = 1
-    gene_of_interest = base_gene
-    for i, feature in enumerate(gene_list[comparison_list_pos:]):
-        base_gene = gene_list[base_gene_list_position]
-        comparison_gene = gene_list[comparison_gene_list_position]
-        base_gene_left = base_gene.location.start
-        base_gene_right = base_gene.location.end
-        comparison_gene_left = comparison_gene.location.start
-        comparison_gene_right = comparison_gene.location.end
-        base_gene_name = base_gene.feature.qualifiers['locus_tag'][0]
-        comparison_gene_name = gene_list[comparison_gene_list_position].feature.qualifiers['locus_tag'][0]
-        # If there's any gap between the two genes, add the gene as-is to the gene list
-        if comparison_gene_left >= base_gene_left:
-            gene_space.add(gene_list[base_gene_list_position])
-        # Else if the comparison gene lies completely within the boundaries of the base gene,
-        ### add the gene as-is to the gene list
-        elif comparison_gene_left <= base_gene_right and comparison_gene_right <= base_gene_right:
-            gene_space.add(gene_list[base_gene_list_position])
-        # Else if the genes overlap, make a new compos
+def union(feature_list, strand):
+    gene_coverage_feature_set = set()
+    intervals = []
+    for feature in feature_list:
+        intervals.append((feature.location.start, feature.location.end))
+    sorted_by_lower_bound = sorted(intervals, key=lambda tup: tup[0])
+    merged = []
+
+    for higher in sorted_by_lower_bound:
+        if not merged:
+            merged.append(higher)
         else:
+            lower = merged[-1]
+        # test for intersection between lower and higher:
+        # we know via sorting that lower[0] <= higher[0]
+            if higher[0] <= lower[1]:
+                upper_bound = max(lower[1], higher[1])
+                merged[-1] = (lower[0], upper_bound)  # replace by merged interval
+            else:
+                merged.append(higher)
+    for entry in merged:
+        new_feature = make_IGR_feature(entry[0], entry[1], 'gene_no_overlap', strand)
+        gene_coverage_feature_set.add(new_feature)
+    return gene_coverage_feature_set
 
 with open('229.opr', 'r') as operon_input:
     operon_reader = csv.reader(operon_input, delimiter = '\t')
@@ -152,6 +155,7 @@ igrs_within_operons = set()
 for operon_id, gene_feature_list in operon_dict.items():
     operon_gene_list = feature_to_gene_list(gene_feature_list)
     # Search for IGRs within each operon.
+    strand = operon_gene_list[0][3]
     operon_igrs = get_ss_IGRs(reference_sequence, operon_gene_list, 1, 'intra_operon_IGR', strand, leading_trailing=False)
     igrs_within_operons.update(operon_igrs)
 print('intra-operon IGRs identified: ', len(igrs_within_operons))
@@ -193,10 +197,139 @@ fwd_gene_list = []
 rev_gene_list = []
 for feature in record.features:
     if feature.type == 'gene':
-        if strand == -1:
+        if feature.strand == -1:
             rev_gene_list.append(feature)
-        elif strand == 1:
+        elif feature.strand == 1:
             fwd_gene_list.append(feature)
         else: print('ERROR: not all genbank gene features stranded')
 
+# Find the union between all the location sets
+fwd_coverage_set = union(fwd_gene_list, 1)
+rev_coverage_set = union(rev_gene_list, -1)
+print('forward features reduced from %s genes to %s coverage areas' % (str(len(fwd_gene_list)), str(len(fwd_coverage_set))))
+print('reverse features reduced from %s genes to %s coverage areas' % (str(len(rev_gene_list)), str(len(rev_coverage_set))))
 
+# Reunite the stranded coverage sets into a single set (both strands)
+complete_coverage_set = fwd_coverage_set.union(rev_coverage_set)
+print('length of complete coverage set: ', len(complete_coverage_set))
+print('bp in complete coverage set: ', sum(len(feature) for feature in complete_coverage_set))
+
+############################# DEFINE REGION 4: Regions opposite coding regions ############################
+
+# Create an identical set of features to complete coverage feature, but on the opposite strand
+complementary_coverage_set = set() 
+for feature in complete_coverage_set:
+    start = feature.location.start
+    end = feature.location.end
+    complementary_strand = feature.strand * -1
+    complementary_location = FeatureLocation(start, end, complementary_strand)
+    complementary_feature = SeqFeature(complementary_location, type='opposite_gene_region', strand=complementary_strand)
+    complementary_coverage_set.add(complementary_feature)
+
+print('length of complementary coverage set: ', len(complementary_coverage_set))
+
+###########################################################################################################
+
+#### need to prioritize which categories take precedence, and remove the overlaps!
+# 1. coding regions (region 3)
+# 2. IGRs within operons (region 1)
+# 3. Area opposite genes (region 4)
+# 4. IGRs between transcriptional units (region 2)
+
+bp_region1 = sum(len(feature) for feature in igrs_within_operons) # IGRs within operons
+bp_region2 = sum(len(feature) for feature in igr_between_tus) # IGRs between transcriptional units
+bp_region3 = sum(len(feature) for feature in complete_coverage_set) # Gene coverage area (protein-coding & RNA)
+bp_region4 = sum(len(feature) for feature in complementary_coverage_set) # Area opposite genes (region 3)
+
+total_bp = bp_region1 + bp_region2 + bp_region3 + bp_region4
+print('total base pairs: ', total_bp)
+
+print(bp_region1, bp_region2, bp_region3, bp_region4)
+
+bp_fwd_tus = sum(len(feature) for feature in forward_tus) # Transcriptional units on the forward strand
+bp_rev_tus = sum(len(feature) for feature in reverse_tus) # Transcriptional units on the reverse strand
+print('bp forward tus: ', bp_fwd_tus)
+print('bp reverse tus: ', bp_rev_tus)
+
+sum_len_gene_features = sum(len(feature) for feature in record.features)
+print('sum of all gene feature length: ', sum_len_gene_features)
+sum_fwd_coverage = sum(len(feature) for feature in fwd_coverage_set)
+print('sum of fwd gene coverage: ', sum_fwd_coverage)
+sum_rev_coverage = sum(len(feature) for feature in rev_coverage_set)
+print('sum of fwd gene coverage: ', sum_rev_coverage)
+
+################### CHECK WHICH SETS PROMOTER POSITIONS ARE IN (i.e. where are the promoters?) ###############
+
+# Create ranges tuples to search for each set, forward and reverse
+#forward_dict = {}
+#forward_dict['igr_within_operon'] = list((feature.location.start.position, feature.location.end.position) for feature in igrs_within_operons if feature.strand == 1)
+#forward_dict['igr_between_tu'] = list((feature.location.start.position, feature.location.end.position) for feature in igr_between_tus if feature.strand == 1)
+#forward_dict['gene_coding_region'] = list((feature.location.start.position, feature.location.end.position) for feature in complete_coverage_set if feature.strand == 1)
+#forward_dict['opposite_gene_coding'] = list((feature.location.start.position, feature.location.end.position) for feature in complementary_coverage_set if feature.strand == 1)
+
+#reverse_dict = {}
+#reverse_dict['igr_within_operon'] = list((feature.location.start.position, feature.location.end.position) for feature in igrs_within_operons if feature.strand == -1)
+#reverse_dict['igr_between_tu'] = list((feature.location.start.position, feature.location.end.position) for feature in igr_between_tus if feature.strand == -1)
+#reverse_dict['gene_coding_region'] = list((feature.location.start.position, feature.location.end.position) for feature in complete_coverage_set if feature.strand == -1)
+#reverse_dict['opposite_gene_coding'] = list((feature.location.start.position, feature.location.end.position) for feature in complementary_coverage_set if feature.strand == -1)
+
+promoters_of_interest = find_35_10_promoters('NC_004350_2.gb', 'strep_mutans_ext_35_only_test.csv')
+
+with open('TSS_regions_test.csv', 'w') as TSS_output:
+    writer = csv.writer(TSS_output, delimiter = '\t')
+    for promoter in promoters_of_interest:
+        matching_regions = []
+        promoter_pos = promoter[1]
+        if promoter[0] == 'F':
+            strand = 1
+            TSS_pos = promoter_pos + 13
+        if promoter[0] == 'R':
+            strand = -1 
+            TSS_pos = promoter_pos - 13
+        for feature in igrs_within_operons:
+            if feature.strand == strand:
+                if TSS_pos in feature:
+                    matching_regions.append('IGRs_within_operons')
+        for feature in igr_between_tus:
+            if feature.strand == strand:
+                if TSS_pos in feature:
+                    matching_regions.append('IGRs_between_TUs')
+        for feature in complete_coverage_set:
+            if feature.strand == strand:
+                if TSS_pos in feature:
+                    matching_regions.append('coding_region')
+        for feature in complementary_coverage_set:
+            if feature.strand == strand:
+                if TSS_pos in feature:
+                    matching_regions.append('complementary_to_coding_region')
+        writer.writerow([strand, promoter_pos, TSS_pos, matching_regions])
+
+############################ VISUALIZATION!! #######################################################
+
+for new_feature in igrs_within_operons:
+    record.features.append(new_feature) # type: #intra_operon_IGR
+for new_feature in igr_between_tus:
+    record.features.append(new_feature) # type: #inter_TU_IGR
+for new_feature in complete_coverage_set:
+    record.features.append(new_feature) # type: #gene_no_overlap
+
+outpath = 'strep_mutans_sliced.gb'
+SeqIO.write(record, open(outpath, 'w'), 'genbank')
+
+gd_diagram = GenomeDiagram.Diagram('Strep mutans, sliced!')
+gd_track_for_features = gd_diagram.new_track(1, name='newly sliced features')
+gd_feature_set = gd_track_for_features.new_set()
+
+for gb_feature in record.features:
+    if gb_feature.type == 'intra_operon_IGR':
+        color = colors.orangered
+        gd_feature_set.add_feature(gb_feature, color=color)
+    if gb_feature.type == 'inter_TU_IGR':
+        color = colors.darkslateblue
+        gd_feature_set.add_feature(gb_feature, color=color)
+    if gb_feature.type == 'gene_no_overlap':
+        color = colors.limegreen
+        gd_feature_set.add_feature(gb_feature, color=color)
+    
+gd_diagram.draw(format='circular', circular=True, pagesize=(20*cm,20*cm), start=0, end=len(record), circle_core=0.7)
+gd_diagram.write('strep_mutans_sliced.pdf', 'PDF')
